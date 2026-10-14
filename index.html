@@ -6840,7 +6840,6 @@ function logEloGame(oppUid, d, isBot) {
   } catch (e) {}
 }
 const _eloRoundsApplied = new Set();   // pro Runde darf die Elo nur EINMAL verrechnet werden (egal wie oft onlineResultHandled zurueckgesetzt wird)
-let _reportingResult = false;          // laeuft gerade ein atomarer Rundenabschluss? -> nicht doppelt melden
 async function handleOnlineResult(winnerName, change) {
   if (onlineResultHandled) return;
   if (!onlineVsBot && onlineMatchId) {
@@ -8565,34 +8564,14 @@ async function reportOnlineResult(winnerName, loserName) {
   if (onlineVsBot) { handleOnlineResult(winnerName, change); return; }
 
   if (fbReady && onlineMatchId) {
-    // RACE-FIX: Bei (fast) gleichzeitigem Tod beider Spieler schrieben frueher beide Clients
-    // ihren eigenen Sieger per update() -> "last write wins" -> die zwei Clients waren sich uneinig
-    // (beide gewonnen / beide verloren / 2-3x Elo). Jetzt beansprucht genau EIN Client die Runde
-    // atomar (dieselbe Transaktion wie beim Forfeit). Nur der Gewinner des Anspruchs schreibt den
-    // (einzigen) Sieger; der andere Client uebernimmt das maßgebliche Ergebnis vom Match-Listener.
-    if (_reportingResult) return;
-    _reportingResult = true;
-    const id = onlineMatchId, round = onlineRound;
-    let claimed = false;
     try {
-      claimed = await Promise.race([RPC.claimMatchEnd(id, round), new Promise(r => setTimeout(() => r(false), 5000))]);
-    } catch (e) { claimed = false; }
-    _reportingResult = false;
-    if (onlineResultHandled || onlineMatchId !== id) return;   // Match inzwischen beendet/gewechselt
-    if (claimed) {
-      try {
-        await RPC.updateMatch(id, { status: "done", winner: winnerName, eloChange: change });
-      } catch (e) {}
-      if (!onlineResultHandled && onlineMatchId === id) handleOnlineResult(winnerName, change);
-    } else {
-      // Ein anderer Client hat die Runde zuerst beendet -> sein Ergebnis kommt ueber den Listener.
-      // Sicherheitsnetz: falls der Listener ausbleibt, das Match nachlesen und uebernehmen.
-      setTimeout(async () => {
-        if (onlineResultHandled || onlineMatchId !== id) return;
-        let w = winnerName;
-        try { const md = await RPC.getMatch(id); if (md && md.status === "done" && md.winner) w = md.winner; } catch (e) {}
-        if (!onlineResultHandled && onlineMatchId === id) handleOnlineResult(w, change);
-      }, 6000);
+      await RPC.updateMatch(onlineMatchId, {
+        status: "done", winner: winnerName, eloChange: change
+      });
+      const _mid = onlineMatchId;
+      setTimeout(() => { if (!onlineResultHandled && onlineMatchId === _mid) handleOnlineResult(winnerName, change); }, 4000);
+    } catch(e) {
+      handleOnlineResult(winnerName, change);
     }
   } else {
     handleOnlineResult(winnerName, change);
