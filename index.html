@@ -1500,15 +1500,11 @@ function rpcOnMatch(matchId, cb) {
   return onValueRobust(ref(db, "onlineMatches/" + matchId), cb);
 }
 async function rpcGetMatch(matchId) { return rpcGet("onlineMatches/" + matchId); }
-// Finish a round in one transaction so the winning result and terminal status
-// cannot be claimed by one client and overwritten by the other.
-async function rpcFinishMatch(matchId, round, result) {
+// Atomar: nur EIN Client darf pro Runde ein Match per Aufgabe beenden (verhindert, dass bei gleichzeitigem Timeout beide als Sieger gewertet werden)
+async function rpcClaimMatchEnd(matchId, round) {
   const uid = requireUid();
-  const r = await runTransaction(ref(db, "onlineMatches/" + matchId), cur => {
-    if (!cur || (Number(cur.round) || 0) !== (Number(round) || 0) || cur.status === "done" || cur.status === "abandoned") return;
-    return Object.assign({}, cur, result, { resultBy: uid, resultRound: Number(round) || 0 });
-  }, { applyLocally: false });
-  return { committed: !!(r && r.committed), match: r && r.snapshot ? r.snapshot.val() : null };
+  const r = await runTransaction(ref(db, "onlineMatches/" + matchId + "/endClaim_" + (Number(round) || 0)), cur => cur ? undefined : { by: uid, ts: Date.now() });
+  return !!(r && r.committed);
 }
 
 // ── head-to-head: namespaced by sorted uid pair, writable by either
@@ -2067,7 +2063,7 @@ window._dobRPC = {
   setOwnQueueEntry: rpcSetOwnQueueEntry, removeOwnQueueEntry: rpcRemoveOwnQueueEntry,
   sendInvite: rpcSendInvite, removeOwnInvite: rpcRemoveOwnInvite,
   createMatch: rpcCreateMatch, updateMatch: rpcUpdateMatch, setMatchPath: rpcSetMatchPath,
-  removeMatch: rpcRemoveMatch, onMatch: rpcOnMatch, getMatch: rpcGetMatch, finishMatch: rpcFinishMatch,
+  removeMatch: rpcRemoveMatch, onMatch: rpcOnMatch, getMatch: rpcGetMatch, claimMatchEnd: rpcClaimMatchEnd,
   setHeadToHead: rpcSetHeadToHead, getHeadToHead: rpcGetHeadToHead,
   setStreakBoard: rpcSetStreakBoard, sendChallenge: rpcSendChallenge, respondChallenge: rpcRespondChallenge, removeChallenge: rpcRemoveChallenge,
   onDisconnectSetOwnStatus: rpcOnDisconnectSetOwnStatus,
@@ -4224,18 +4220,15 @@ async function forfeitOpponent() {
     if (!cur || cur.status === "abandoned" || cur.status === "done") return;
   } catch (e) {}
   if (onlineResultHandled || onlineMatchId !== id) return;
+  // Race-Schutz: bei gleichzeitigem Timeout beider Spieler (Lag, Tab im Hintergrund) darf nur EINER den Sieg bekommen.
+  // Wer den Anspruch nicht bekommt (oder ihn nicht sicher pruefen kann), wertet nichts selbst: das Ergebnis kommt dann vom Match-Listener.
+  let _claimed = false;
+  try { _claimed = await Promise.race([RPC.claimMatchEnd(id, onlineRound), new Promise(r => setTimeout(() => r(false), 5000))]); } catch (e) { _claimed = false; }
+  if (!_claimed || onlineResultHandled || onlineMatchId !== id) return;
+  disarmOnlineDisconnect();
   const change = forfeitChange(true);
-  try {
-    const result = await RPC.finishMatch(id, onlineRound, {
-      status: "abandoned", forfeitBy: (onlineOpponent && onlineOpponent.uid) || null, eloChange: change
-    });
-    if (!result.committed || onlineResultHandled || onlineMatchId !== id) return;
-    disarmOnlineDisconnect();
-    handleOnlineResult(onlineAccount.name, change);
-  } catch (e) {
-    // If the transaction result is uncertain, only the match listener may apply it.
-    console.warn("forfeit result write failed", e && (e.code || e.message));
-  }
+  RPC.updateMatch(id, { status: "abandoned", forfeitBy: (onlineOpponent && onlineOpponent.uid) || null, eloChange: change }).catch(() => {});
+  handleOnlineResult(onlineAccount.name, change);
 }
 
 // ═══════════════════════════════════════════════
@@ -6859,9 +6852,7 @@ async function handleOnlineResult(winnerName, change) {
   window._lastMatchSecs = Math.max(0, (Date.now() - startTime) / 1000);
   stopViewerCount();
   clearActiveMatchMarker();
-  // The terminal result is already stored. Do not let a later disconnect
-  // rewrite it as "abandoned" (which could make both clients claim a win).
-  disarmOnlineDisconnect();
+  armOnlineDisconnect(false);
   campWarn(false);
   running = false;
   clearAllTimers();
@@ -8555,8 +8546,9 @@ function arenaEliminate(p) {
   }
 }
 
-// Finish the match status and winner atomically; only the committed result
-// may be applied locally. Other clients use the match listener.
+// CHANGED: result reporting now uses the guarded RPC and clamps the
+// elo delta before writing, instead of an unrestricted dbUpdate on a
+// name-derived path.
 async function reportOnlineResult(winnerName, loserName) {
   if (onlineResultHandled) return;
 
@@ -8573,20 +8565,34 @@ async function reportOnlineResult(winnerName, loserName) {
   if (onlineVsBot) { handleOnlineResult(winnerName, change); return; }
 
   if (fbReady && onlineMatchId) {
+    // RACE-FIX: Bei (fast) gleichzeitigem Tod beider Spieler schrieben frueher beide Clients
+    // ihren eigenen Sieger per update() -> "last write wins" -> die zwei Clients waren sich uneinig
+    // (beide gewonnen / beide verloren / 2-3x Elo). Jetzt beansprucht genau EIN Client die Runde
+    // atomar (dieselbe Transaktion wie beim Forfeit). Nur der Gewinner des Anspruchs schreibt den
+    // (einzigen) Sieger; der andere Client uebernimmt das maßgebliche Ergebnis vom Match-Listener.
     if (_reportingResult) return;
     _reportingResult = true;
     const id = onlineMatchId, round = onlineRound;
+    let claimed = false;
     try {
-      const result = await RPC.finishMatch(id, round, { status: "done", winner: winnerName, eloChange: change });
-      if (result.committed && !onlineResultHandled && onlineMatchId === id) {
-        handleOnlineResult(result.match && result.match.winner || winnerName, result.match && result.match.eloChange || change);
-      }
-    } catch (e) {
-      // A failed or uncertain transaction must never award a locally guessed winner.
-      // The match listener applies the result if the server committed it.
-      console.warn("match result write failed", e && (e.code || e.message));
-    } finally {
-      _reportingResult = false;
+      claimed = await Promise.race([RPC.claimMatchEnd(id, round), new Promise(r => setTimeout(() => r(false), 5000))]);
+    } catch (e) { claimed = false; }
+    _reportingResult = false;
+    if (onlineResultHandled || onlineMatchId !== id) return;   // Match inzwischen beendet/gewechselt
+    if (claimed) {
+      try {
+        await RPC.updateMatch(id, { status: "done", winner: winnerName, eloChange: change });
+      } catch (e) {}
+      if (!onlineResultHandled && onlineMatchId === id) handleOnlineResult(winnerName, change);
+    } else {
+      // Ein anderer Client hat die Runde zuerst beendet -> sein Ergebnis kommt ueber den Listener.
+      // Sicherheitsnetz: falls der Listener ausbleibt, das Match nachlesen und uebernehmen.
+      setTimeout(async () => {
+        if (onlineResultHandled || onlineMatchId !== id) return;
+        let w = winnerName;
+        try { const md = await RPC.getMatch(id); if (md && md.status === "done" && md.winner) w = md.winner; } catch (e) {}
+        if (!onlineResultHandled && onlineMatchId === id) handleOnlineResult(w, change);
+      }, 6000);
     }
   } else {
     handleOnlineResult(winnerName, change);
